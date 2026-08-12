@@ -6,7 +6,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -491,6 +492,130 @@ pub async fn nim_keys(
     }
     match commit(&state, &mut guard, cand) {
         Ok(()) => ok_json(serde_json::json!({"ok": true})),
+        Err(e) => bad_request(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BatchImportReq {
+    #[serde(default)]
+    rpm: Option<usize>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// `POST /api/settings/nim-keys/batch-import` 鈥?bulk NIM-key import.
+///
+/// Accepts a raw text/plain body (one key per line). Blank lines and lines
+/// starting with `#` are dropped; each surviving line is trimmed and deduped
+/// within this request. Keys already held by the store count as `duplicates`
+/// and are not re-inserted. Everything goes through `commit`, so a validation
+/// failure rolls the whole batch back atomically 鈥?partial writes are
+/// impossible. Non-admin callers can import only as themselves (`owner` is
+/// ignored); an admin may target another user.
+pub async fn nim_keys_batch_import(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<BatchImportReq>,
+    Extension(Identity(username)): Extension<Identity>,
+    body: Bytes,
+) -> Response {
+    let text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return bad_request("body must be UTF-8 text"),
+    };
+
+    // Preserve first-seen order while deduping within this request.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unique: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if seen.insert(line.to_owned()) {
+            unique.push(line.to_owned());
+        }
+    }
+
+    if unique.is_empty() {
+        return bad_request("no keys in body (send one key per line, text/plain)");
+    }
+
+    let rpm = q.rpm.unwrap_or(40);
+    if !(1..=10_000).contains(&rpm) {
+        return bad_request("rpm out of range 1-10000");
+    }
+    let enabled = q.enabled.unwrap_or(true);
+
+    let mut guard = state.store.lock().unwrap();
+    let Some(role) = role_of(&guard, &username) else {
+        return stale_session();
+    };
+    let owner = match q.owner.as_deref() {
+        Some(o) if !o.is_empty() && role.is_admin() => o.trim().to_owned(),
+        Some(o) if !o.is_empty() && !role.is_admin() => return forbidden(
+            "only an admin may import keys for another user",
+        ),
+        _ => username.clone(),
+    };
+    if guard.user(&owner).is_none() {
+        return bad_request(format!("owner {owner:?} is not a user"));
+    }
+
+    let mut cand = guard.clone();
+    let mut existing: std::collections::HashSet<String> = cand
+        .upstream
+        .nim_keys
+        .iter()
+        .map(|k| k.key.clone())
+        .collect();
+
+    let mut duplicates = 0usize;
+    let mut invalid: Vec<serde_json::Value> = Vec::new();
+    let mut imported: Vec<String> = Vec::new();
+    for (idx, key) in unique.iter().enumerate() {
+        if key.trim().is_empty() {
+            invalid.push(serde_json::json!({"index": idx, "reason": "empty key"}));
+            continue;
+        }
+        if existing.contains(key.as_str()) {
+            duplicates += 1;
+            continue;
+        }
+        cand.upstream.nim_keys.push(NimKey {
+            key: key.clone(),
+            owner: owner.clone(),
+            enabled,
+            rpm,
+        });
+        imported.push(fingerprint(key));
+        existing.insert(key.clone());
+    }
+
+    if imported.is_empty() {
+        return ok_json(serde_json::json!({
+            "ok": true,
+            "imported": 0,
+            "duplicates": duplicates,
+            "invalid": invalid.len(),
+            "invalid_detail": invalid,
+            "imported_fingerprints": [],
+        }));
+    }
+
+    let imported_count = imported.len();
+    let fingerprint_list = imported.clone();
+    match commit(&state, &mut guard, cand) {
+        Ok(()) => ok_json(serde_json::json!({
+            "ok": true,
+            "imported": imported_count,
+            "duplicates": duplicates,
+            "invalid": invalid.len(),
+            "invalid_detail": invalid,
+            "imported_fingerprints": fingerprint_list,
+        })),
         Err(e) => bad_request(e),
     }
 }

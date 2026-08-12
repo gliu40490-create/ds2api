@@ -697,7 +697,7 @@ async fn buffered(
     path_query: String,
     headers: HeaderMap,
     body: Bytes,
-    prefer: Option<usize>,
+    mut prefer: Option<usize>,
     deadline: Instant,
 ) -> Response {
     let _active = crate::dispatch::scopeguard(|| gauge!("nimproxy_active_requests").decrement(1.0));
@@ -716,9 +716,14 @@ async fn buffered(
             return gateway_timeout(&cfg, state.pool().len());
         };
         let sent_at = Instant::now();
-        // A non-streaming request gets an overall timeout so a stalled body read
-        // can't pin an in-flight slot forever (streaming has no such cap).
-        let resp = match upstream_request(
+        // Two-tier timeout. The FIRST byte must arrive within
+        // `first_byte_timeout` (default 10s); if the upstream accepted the
+        // connection but stalls — exactly the failure mode of a throttled
+        // NVIDIA model behind a stuck Tor exit — we bench the lane and try
+        // the next one. Once the response head is back, `request_timeout`
+        // still bounds the full body read so a stalled buffered read can't
+        // pin the slot forever.
+        let send_fut = upstream_request(
             &state.http,
             &cfg.base_url,
             &method,
@@ -727,15 +732,40 @@ async fn buffered(
             &slot.key,
             &body,
         )
-        .timeout(cfg.request_timeout)
-        .send()
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                bench(&slot, "connect", Duration::from_secs(5));
-                continue;
+        .timeout(cfg.request_timeout);
+        let resp = if !state.first_byte_timeout.is_zero() {
+            match tokio::time::timeout(state.first_byte_timeout, send_fut.send()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
+                    bench(&slot, "connect", Duration::from_secs(5));
+                    // Drop sticky affinity on any failure: the sticky lane
+                    // just proved unhealthy, so don't re-pin the next retry
+                    // back onto it. The pool's spill path will pick the
+                    // least-loaded healthy lane instead.
+                    prefer = None;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        lane = slot.lane,
+                        secs = state.first_byte_timeout.as_secs(),
+                        "upstream first-byte timeout, retrying on next lane",
+                    );
+                    bench(&slot, "first-byte-timeout", state.first_byte_timeout);
+                    prefer = None;
+                    continue;
+                }
+            }
+        } else {
+            match send_fut.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
+                    bench(&slot, "connect", Duration::from_secs(5));
+                    prefer = None;
+                    continue;
+                }
             }
         };
         if retryable(resp.status()) && Instant::now() < deadline {
@@ -749,10 +779,12 @@ async fn buffered(
                 state
                     .governor
                     .note_exhausted(&ctx.model, cfg.governor.overrides.get(&ctx.model).copied());
+                prefer = None;
                 continue; // permit drops here; re-admission waits out the drain
             }
             tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
             bench(&slot, status.as_str(), backoff);
+            prefer = None;
             continue;
         }
         histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
@@ -774,7 +806,7 @@ fn streaming(
     path_query: String,
     headers: HeaderMap,
     mut body: Bytes,
-    prefer: Option<usize>,
+    mut prefer: Option<usize>,
     mut fallback: Option<Bytes>,
     inflight_guard: impl Send + 'static,
     request_deadline: Option<RequestDeadline>,
@@ -836,7 +868,11 @@ fn streaming(
                 };
 
                 let sent_at = Instant::now();
-                let resp = match upstream_request(
+                // FIRST-byte timeout mirrors the buffered path: a Tor exit that
+                // hangs without responding tears this lane down and the next
+                // lane is tried. The stream body itself relies on the
+                // `stream_idle` stall cutoff below (generations can be long).
+                let send_fut = upstream_request(
                     &state.http,
                     &cfg.base_url,
                     &method,
@@ -844,15 +880,40 @@ fn streaming(
                     &headers,
                     &slot.key,
                     &body,
-                )
-                .send()
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                        bench(&slot, "connect", Duration::from_secs(5));
-                        continue;
+                );
+                let resp = if !state.first_byte_timeout.is_zero() {
+                    match tokio::time::timeout(state.first_byte_timeout, send_fut.send()).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
+                            bench(&slot, "connect", Duration::from_secs(5));
+                            // Same sticky-drop rationale as `buffered`: a
+                            // first-byte timeout proved the lane is currently
+                            // bad, so spread the next retry across the pool
+                            // instead of pinning back onto it.
+                            prefer = None;
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                lane = slot.lane,
+                                secs = state.first_byte_timeout.as_secs(),
+                                "upstream first-byte timeout, retrying on next lane",
+                            );
+                            bench(&slot, "first-byte-timeout", state.first_byte_timeout);
+                            prefer = None;
+                            continue;
+                        }
+                    }
+                } else {
+                    match send_fut.send().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
+                            bench(&slot, "connect", Duration::from_secs(5));
+                            prefer = None;
+                            continue;
+                        }
                     }
                 };
 
@@ -887,6 +948,7 @@ fn streaming(
                         tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
                         bench(&slot, status.as_str(), backoff);
                     }
+                    prefer = None;
                     if !send(": retrying\n\n").await {
                         record_request(&ctx, "disconnect");
                         return;

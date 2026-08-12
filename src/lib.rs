@@ -105,6 +105,13 @@ pub struct AppState {
     pub inflight: AtomicUsize,
     /// Per-model worker-concurrency gate (runtime state, settings in Config).
     pub governor: Arc<governor::Governor>,
+    /// Deadline for receiving the *first byte* of an upstream response (TCP +
+    /// TLS + server think time). Fails a lane fast when the upstream accepts
+    /// the connection but stalls, so a stuck Tor exit gets benched and the
+    /// next lane is tried within seconds rather than pinning a slot for the
+    /// full request timeout. Default 10s; tuned via
+    /// `NIM_FIRST_BYTE_TIMEOUT_SECS`. 0 disables the cap (legacy behavior).
+    pub first_byte_timeout: Duration,
     pub history: Arc<history::History>,
     /// Shared metrics registry rendered by both `/metrics` and dashboard-now.
     pub prometheus: PrometheusHandle,
@@ -483,11 +490,24 @@ pub async fn run() {
     let state = Arc::new(AppState {
         dispatch: Dispatcher::new(pool.clone()),
         pool,
-        http: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+        http: {
+            let mut b = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10));
+            // Allow the operator to route all upstream traffic through a SOCKS5
+            // (Tor) or HTTP proxy by setting HTTPS_PROXY / ALL_PROXY, e.g.
+            // `socks5h://172.17.0.1:9050` for a host-side Tor daemon.
+            for var in ["HTTPS_PROXY", "ALL_PROXY"] {
+                if let Ok(p) = std::env::var(var) {
+                    if let Ok(proxy) = reqwest::Proxy::all(p.trim()) {
+                        tracing::info!(%var, proxy = %p.trim(), "routing upstream via proxy");
+                        b = b.proxy(proxy);
+                        break;
+                    }
+                }
+            }
             // No overall timeout: generations stream for a long time.
-            .build()
-            .expect("http client"),
+            b.build().expect("http client")
+        },
         models_cache: Mutex::new(None),
         no_inject: std::sync::Mutex::new(std::collections::HashSet::new()),
         model_labels: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -502,6 +522,12 @@ pub async fn run() {
         data_dir,
         setup_required: std::sync::atomic::AtomicBool::new(setup_required),
         cfg: RwLock::new(Arc::new(cfg)),
+        first_byte_timeout: Duration::from_secs(
+            std::env::var("NIM_FIRST_BYTE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10),
+        ),
     });
 
     let dash = || async {
@@ -521,6 +547,10 @@ pub async fn run() {
         .route("/api/dashboard/now", get(api_dashboard_now))
         .route("/api/config", get(settings::api_config))
         .route("/api/settings/nim-keys", post(settings::nim_keys))
+        .route(
+            "/api/settings/nim-keys/batch-import",
+            post(settings::nim_keys_batch_import),
+        )
         .route("/api/settings/clients", post(settings::clients))
         .route("/api/settings/upstream", post(settings::upstream))
         .route("/api/settings/limits", post(settings::limits))
